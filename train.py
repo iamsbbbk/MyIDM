@@ -1,383 +1,367 @@
 import os
-import sys
 import argparse
 import logging
-import random
-import time
-from pathlib import Path
-from datetime import datetime
-
 import numpy as np
-import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler, autocast
+from torchvision import transforms, utils as vutils
 from tqdm import tqdm
-from skimage.metrics import structural_similarity as ssim_metric
-from skimage.metrics import peak_signal_noise_ratio as psnr_metric
+from datetime import datetime
+import traceback
+from torch.utils.tensorboard import SummaryWriter
 
-# 假设 model.py 和 utils.py 在同一目录下
-try:
-    from model import Net
-    from diffusers import StableDiffusionPipeline
-except ImportError as e:
-    print(f"Error: 缺少必要依赖文件。请确保 model.py 和 diffusers 库已正确安装。\n详细信息: {e}")
-    sys.exit(1)
-
+from diffusers import UNet2DConditionModel
+from model import Net
+from skimage.metrics import peak_signal_noise_ratio as psnr_calc
+from skimage.metrics import structural_similarity as ssim_calc
 
 # ==========================================
-# 1. 配置与日志系统 (Robust Logging)
+# 0. 核心创新模块 (FFL + 可学习采样矩阵)
 # ==========================================
-def setup_logging(save_dir, exp_name):
-    os.makedirs(save_dir, exist_ok=True)
-    log_file = os.path.join(save_dir, f"{exp_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+class FocalFrequencyLoss(nn.Module):
+    """频域损失函数：惩罚高频细节恢复的误差"""
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.l1_loss = nn.L1Loss(reduction='none')
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
+    def forward(self, pred, target):
+        pred_freq = torch.fft.fftn(pred, dim=(-2, -1))
+        target_freq = torch.fft.fftn(target, dim=(-2, -1))
+        
+        pred_freq = torch.stack([pred_freq.real, pred_freq.imag], -1)
+        target_freq = torch.stack([target_freq.real, target_freq.imag], -1)
 
+        freq_distance = self.l1_loss(pred_freq, target_freq).mean(dim=-1)
+        weight = (freq_distance ** self.alpha)
+        weight = weight / (weight.max() + 1e-8)
+        
+        return (freq_distance * weight).mean()
 
-# ==========================================
-# 2. 压缩感知算子 (CS Operators)
-# ==========================================
-def make_A_AT_for_patch(psz, B, Phi, device, perm=None, perm_inv=None):
-    """
-    构建基于块的压缩感知算子 A (采样) 和 AT (重构)。
-    针对 32x32 小图像，建议 Block Size 设为 8 或 4。
-    """
-    nb = (psz // B) * (psz // B)
-    if perm is None:
-        perm = torch.arange(nb, device=device)
-    if perm_inv is None:
-        perm_inv = torch.empty_like(perm)
-        perm_inv[perm] = torch.arange(nb, device=device)
-
-    # Phi shape: [B*B, q]
-
-    def A(z):
-        # z: [bsz, C, psz, psz] -> 这里的 C 通常是 1 或 3，CS 通常针对单通道处理或逐通道
-        # 为了简化，我们假设 z 是 [bsz, 1, psz, psz] 或者我们在外部处理通道
-        if z.shape[1] == 3:
-            # 如果是 RGB，我们需要对每个通道分别做，或者把通道展平
-            # 这里简化处理：将 RGB 视为 Batch 的一部分进行投影，或者只处理单通道
-            # 方案：Reshape [B*3, 1, H, W]
-            b, c, h, w = z.shape
-            z = z.reshape(b * c, 1, h, w)
-
-        z = z.float()
-        blocks = F.unfold(z, kernel_size=B, stride=B)  # [bsz*c, B*B, nb]
-        blocks = blocks.transpose(1, 2)  # [bsz*c, nb, B*B]
-        blocks = blocks[:, perm, :]
-        y_meas = blocks @ Phi  # [bsz*c, nb, q]
-        return y_meas
-
-    def AT(y):
-        # y: [bsz*c, nb, q]
-        y = y.float()
-        blocks = y @ Phi.t()  # [bsz*c, nb, B*B]
-        blocks = blocks[:, perm_inv, :]
-        blocks = blocks.transpose(1, 2)  # [bsz*c, B*B, nb]
-        rec = F.fold(blocks, output_size=(psz, psz), kernel_size=B, stride=B)
-
-        # 恢复 RGB 维度
-        if rec.shape[0] % 3 == 0:  # 简单的 heuristic，实际应传入原始 batch size
-            # 注意：这里在 forward 中通常无法得知原始 batch size，
-            # 但 IDM 的 model.py 通常处理的是 [B, C, H, W]，所以这里返回 unfolded 即可
-            # 由 Model 内部处理维度
-            pass
-        return rec
-
-    return A, AT
-
+class LearnableCSMatrix(nn.Module):
+    """端到端可学习的压缩感知测量矩阵"""
+    def __init__(self, N, q, device):
+        super().__init__()
+        # 初始依然保持正交性，帮助稳定训练
+        U, S, V = torch.linalg.svd(torch.randn(N, N, device=device))
+        self.Phi = nn.Parameter((U @ V)[:, :q].float())
+    
+    def forward(self):
+        return self.Phi
 
 # ==========================================
-# 3. 专家数据集 (Expert Dataset with Normalization)
+# 1. Dataset (鲁棒最大最小平均化)
 # ==========================================
 class ToolWearExpertDataset(Dataset):
-    def __init__(self, data_root, target_class, mode='train', seed=42):
-        """
-        Args:
-            data_root: 数据根目录
-            target_class: 目标类别 {0, 1, 2, 3}
-            mode: 'train' (70%), 'val' (20%), 'test' (10%)
-        """
-        self.mode = mode
-        filename = f"rgb_x_{target_class}.npy"
-        file_path = os.path.join(data_root, filename)
-
+    def __init__(self, root_dir, target_class, split='train'):
+        self.data = []
+        file_path = os.path.join(root_dir, f"rgb_x_{target_class}.npy")
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"找不到数据集文件: {file_path}")
+            raise FileNotFoundError(f"Dataset file not found: {file_path}")
 
-        logging.info(f"正在加载专家数据集 (Class {target_class}): {file_path}")
         try:
-            # 加载数据 (N, 3, 32, 32)
-            all_data = np.load(file_path)
-            total_samples = len(all_data)
-            logging.info(f"原始数据形状: {all_data.shape}, 样本数: {total_samples}")
-
-            # 随机打乱索引 (固定种子确保可复现)
-            indices = np.arange(total_samples)
-            np.random.seed(seed)
-            np.random.shuffle(indices)
-
-            # 7:2:1 划分
-            n_train = int(total_samples * 0.7)
-            n_val = int(total_samples * 0.2)
-
-            if mode == 'train':
-                self.indices = indices[:n_train]
-            elif mode == 'val':
-                self.indices = indices[n_train: n_train + n_val]
-            elif mode == 'test':
-                self.indices = indices[n_train + n_val:]
-            else:
-                raise ValueError("Mode must be 'train', 'val', or 'test'")
-
-            self.data = all_data[self.indices]
-            logging.info(f"Mode [{mode}] 加载完成: {len(self.data)} 样本")
-
+            all_data = np.load(file_path, mmap_mode='r')
+            all_data = np.array(all_data).astype(np.float32)
         except Exception as e:
-            logging.error(f"数据加载失败: {e}")
-            raise e
+            raise RuntimeError(f"Failed to load numpy file: {e}")
+
+        # ---------------------------------------------------------
+        # 💡 [工程优化]: 鲁棒的最大最小平均化 (Robust Min-Max)
+        # 保证数值不会太小，剔除极端的反光亮点或黑点干扰
+        # ---------------------------------------------------------
+        p_min = np.percentile(all_data, 1)   # 取 1% 分位数
+        p_max = np.percentile(all_data, 99)  # 取 99% 分位数
+        
+        # 1. 截断极端值
+        all_data = np.clip(all_data, p_min, p_max)
+        # 2. 最大最小归一化
+        all_data = (all_data - p_min) / (p_max - p_min + 1e-8)
+
+        np.random.seed(42)
+        indices = np.random.permutation(len(all_data))
+        all_data = all_data[indices]
+
+        split_idx = int(len(all_data) * 0.85)
+
+        if split == 'train':
+            self.data = all_data[:split_idx]
+            self.transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomVerticalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+            ])
+        else:
+            self.data = all_data[split_idx:]
+            self.transform = None
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # shape: (3, 32, 32)
-        x = self.data[idx]
-
-        # 转为 float32
-        x = x.astype(np.float32)
-
-        # ==========================================
-        # 核心功能：Min-Max Normalization (Instance Level)
-        # ==========================================
-        # 针对每个样本单独归一化，拉伸对比度
-        x_min = x.min()
-        x_max = x.max()
-
-        if x_max - x_min > 1e-8:
-            x = (x - x_min) / (x_max - x_min)
-        else:
-            # 如果图像是纯色的（极少见），保持原样或置零
-            x = x - x_min
-
-            # 转换为 Tensor
-        x_tensor = torch.from_numpy(x)
-
-        return x_tensor
-
+        img = torch.from_numpy(self.data[idx])
+        if self.transform:
+            img = self.transform(img)
+        return img
 
 # ==========================================
-# 4. 指标计算工具
+# 2. Operator Helper
 # ==========================================
-def calculate_metrics(pred_batch, target_batch):
-    """
-    计算 batch 的平均 PSNR 和 SSIM
-    Input: [B, C, H, W] in range [0, 1]
-    """
-    psnr_vals = []
-    ssim_vals = []
+def make_A_AT_for_patch(im_size, block_size, Phi):
+    # 移除 unfold/fold 的重复初始化，加快速度
+    unfold = nn.Unfold(kernel_size=block_size, stride=block_size)
+    fold = nn.Fold(output_size=(im_size, im_size), kernel_size=block_size, stride=block_size)
 
-    # 移至 CPU 并转为 numpy
-    preds = pred_batch.detach().cpu().numpy()
-    targets = target_batch.detach().cpu().numpy()
+    def A(x):
+        return torch.matmul(Phi.t(), unfold(x))
 
-    for i in range(preds.shape[0]):
-        p = preds[i].transpose(1, 2, 0)  # [H, W, C]
-        t = targets[i].transpose(1, 2, 0)
+    def AT(y):
+        return fold(torch.matmul(Phi, y))
 
-        # 确保范围在 [0, 1] 之间，防止数值误差
-        p = np.clip(p, 0, 1)
-        t = np.clip(t, 0, 1)
-
-        psnr_vals.append(psnr_metric(t, p, data_range=1.0))
-        # SSIM 需要指定 data_range 和 channel_axis
-        ssim_vals.append(ssim_metric(t, p, data_range=1.0, channel_axis=2))
-
-    return np.mean(psnr_vals), np.mean(ssim_vals)
-
+    return A, AT
 
 # ==========================================
-# 5. 主训练循环
+# 3. Loss & Metrics
 # ==========================================
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+    def forward(self, x, y):
+        diff = x - y
+        return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
+
+def calculate_metrics(img1, img2):
+    img1 = img1.detach().cpu().numpy().transpose(0, 2, 3, 1)
+    img2 = img2.detach().cpu().numpy().transpose(0, 2, 3, 1)
+    
+    psnr_val, ssim_val = 0.0, 0.0
+    batch_size = img1.shape[0]
+    
+    for i in range(batch_size):
+        psnr_val += psnr_calc(img2[i], img1[i], data_range=1.0)
+        ssim_val += ssim_calc(img2[i], img1[i], data_range=1.0, channel_axis=-1, win_size=3)
+        
+    return psnr_val / batch_size, ssim_val / batch_size
+
+# ==========================================
+# 4. Main Training Logic
+# ==========================================
+def setup_logging(save_dir, exp_name):
+    os.makedirs(save_dir, exist_ok=True)
+    log_file = os.path.join(save_dir, f"{exp_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
+    logger = logging.getLogger(exp_name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_file)
+        sh = logging.StreamHandler()
+        formatter = logging.Formatter("%(asctime)s | %(message)s")
+        fh.setFormatter(formatter)
+        sh.setFormatter(formatter)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
+
+def save_validation_images(x_gt, x_rec, epoch, save_dir):
+    vis_dir = os.path.join(save_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    comparison = torch.cat([x_gt[:8], x_rec[:8]], dim=0)
+    grid = vutils.make_grid(comparison, nrow=8, padding=2, normalize=True)
+    vutils.save_image(grid, os.path.join(vis_dir, f"epoch_{epoch}_compare.png"))
+
 def train():
-    parser = argparse.ArgumentParser(description="M-IDM Expert Training")
-    # 路径参数
-    parser.add_argument("--data_dir", type=str, default=r"D:\WORK\GraduationProgramme\IDM\MyIDM\data\ToolWear_RGB")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints")
-    parser.add_argument("--sd_path", type=str, default="./sd15", help="Stable Diffusion v1.5 路径")
-
-    # 训练参数
-    parser.add_argument("--target_class", type=int, default=3, choices=[0, 1, 2, 3], help="指定训练哪个磨损状态")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default=r"./data/ToolWear_RGB")
+    parser.add_argument("--save_dir", type=str, default="./checkpoints_idm_phys")
+    parser.add_argument("--sd_path", type=str, default="./sd15")
+    parser.add_argument("--target_class", type=int, default=0)
     parser.add_argument("--epoch", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=32)  # 图片很小(32x32)，Batch size 可以大一点
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--step_number", type=int, default=3, help="IDM 时间步数 T")
-    parser.add_argument("--cs_ratio", type=float, default=0.1, help="压缩采样率")
-    parser.add_argument("--block_size", type=int, default=8, help="CS 块大小，对于 32x32 图片建议设为 8")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--step_number", type=int, default=8)
+    parser.add_argument("--cs_ratio", type=float, default=0.1)
+    parser.add_argument("--block_size", type=int, default=8)
 
     args = parser.parse_args()
-
-    # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 初始化日志
-    exp_name = f"Class{args.target_class}_Ratio{args.cs_ratio}"
+    exp_name = f"EagleEye_C{args.target_class}_R{args.cs_ratio}"
     logger = setup_logging(args.save_dir, exp_name)
-    logger.info(f"启动训练任务: {exp_name}")
-    logger.info(f"参数列表: {vars(args)}")
+    writer = SummaryWriter(log_dir=os.path.join(args.save_dir, "runs", exp_name))
+    logger.info(f"Config: {vars(args)}")
 
+    # 1. Load Model
     try:
-        # --------------------
-        # 1. 准备数据
-        # --------------------
-        train_dataset = ToolWearExpertDataset(args.data_dir, args.target_class, mode='train')
-        val_dataset = ToolWearExpertDataset(args.data_dir, args.target_class, mode='val')
+        unet = UNet2DConditionModel.from_pretrained(args.sd_path, subfolder="unet", local_files_only=True)
+    except Exception:
+        unet = UNet2DConditionModel.from_pretrained(args.sd_path, local_files_only=True)
 
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,
-                                  pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    model = Net(T=args.step_number, unet=unet).to(device)
 
-        # --------------------
-        # 2. 准备模型 (M-IDM)
-        # --------------------
-        logger.info("加载 Stable Diffusion UNet...")
-        # 注意：SD v1.5 默认针对 512x512。对于 32x32 输入，Latent 将变为 4x4。
-        # 如果 Net 实现中能处理小尺寸则没问题，否则可能需要 Upsample 输入或调整 UNet 配置。
-        # 这里假设 Net (M-IDM) 已经适配或 SD UNet 足够鲁棒。
-        pipe = StableDiffusionPipeline.from_pretrained(args.sd_path, local_files_only=True, safety_checker=None).to(
-            device)
-        unet = pipe.unet
-        unet.requires_grad_(True)  # 允许微调
+    # 2. CS Matrix Setup (可学习矩阵)
+    N = args.block_size ** 2
+    q = int(np.ceil(args.cs_ratio * N))
+    cs_matrix_module = LearnableCSMatrix(N, q, device).to(device)
+    logger.info(f"Learnable CS Matrix: N={N}, q={q}, Ratio={args.cs_ratio}")
 
-        model = Net(args.step_number, unet).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-        scaler = GradScaler()
+    # 3. Optimizer (联合优化网络和矩阵)
+    optimizer = torch.optim.AdamW([
+        {'params': model.parameters(), 'lr': args.lr},
+        {'params': cs_matrix_module.parameters(), 'lr': args.lr * 0.1} # 矩阵的学习率稍小，保持物理稳定性
+    ], weight_decay=1e-2)
+    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, eta_min=1e-6)
 
-        # --------------------
-        # 3. 准备 CS 算子
-        # --------------------
-        img_size = 32  # 固定为数据集尺寸
-        B = args.block_size
-        N = B * B
-        q = int(np.ceil(args.cs_ratio * N))
+    # 4. Losses
+    criterion_img = CharbonnierLoss().to(device)
+    criterion_meas = CharbonnierLoss().to(device)
+    criterion_freq = FocalFrequencyLoss().to(device)
+    
+    scaler = GradScaler(enabled=torch.cuda.is_available())
 
-        # 初始化高斯随机矩阵并正交化
-        torch.manual_seed(42)  # 保证 A 矩阵在多次实验中一致
-        U_mat, _, _ = torch.linalg.svd(torch.randn(N, N, device=device))
-        Phi = U_mat[:, :q].float()
-        logger.info(f"CS 矩阵初始化完成: Block={B}, Input={N}, Output={q}, Ratio={args.cs_ratio}")
+    # 5. Data
+    train_dataset = ToolWearExpertDataset(args.data_dir, args.target_class, 'train')
+    val_dataset = ToolWearExpertDataset(args.data_dir, args.target_class, 'val')
+    
+    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-        # --------------------
-        # 4. 训练循环
-        # --------------------
-        best_ssim = 0.0
+    best_psnr = 0.0
 
-        for epoch in range(1, args.epoch + 1):
-            model.train()
-            train_loss = 0.0
+    # 6. Training Loop
+    for epoch in range(1, args.epoch + 1):
+        model.train()
+        cs_matrix_module.train()
+        loss_avg = 0.0
+        
+        # 频域损失 Warm-up 策略
+        # 前 5 个 Epoch 专注学轮廓，第 6 个 Epoch 开始逐渐加入高频惩罚
+        ffl_weight = 0.0 if epoch <= 5 else min(0.1, 0.02 * (epoch - 5))
 
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epoch} [Train]")
-            for x in pbar:
-                x = x.to(device)  # [B, 3, 32, 32]
-
-                # 由于 CS 通常处理单通道或展平，这里我们需要适配 A/AT
-                # 将 RGB 视为 Batch 维度堆叠: [B*3, 1, 32, 32]
-                b, c, h, w = x.shape
-                x_reshaped = x.view(b * c, 1, h, w)
-
-                # 生成动态的 A, AT (虽然 Phi 固定，但 Permutation 可以随机以增强鲁棒性，这里为了稳定暂不随机 Perm)
-                A, AT = make_A_AT_for_patch(img_size, B, Phi, device)
-
-                # CS 采样
-                y = A(x_reshaped)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epoch} (FFL Wt: {ffl_weight:.3f})")
+        
+        for step, x_gt in enumerate(pbar):
+            try:
+                x_gt = x_gt.to(device)
+                b, c, h, w = x_gt.shape 
+                x_flat = x_gt.view(b*c, 1, h, w) 
+                
+                # 动态获取当前的采样矩阵并生成算子
+                Phi = cs_matrix_module()
+                A_func, AT_func = make_A_AT_for_patch(h, args.block_size, Phi)
+                
+                with torch.no_grad():
+                    # 模拟压缩感知测量
+                    y = A_func(x_flat)
 
                 optimizer.zero_grad()
-                with autocast():
-                    # 模型前向
-                    # model 的输入逻辑需要根据 model.py 实际情况。
-                    # 通常 IDM 接受 [B, C, H, W] 和对应的 A, AT
-                    # 这里我们将 reshaping 还原，让 model 内部处理，或者让 model 处理 reshaped
-                    # 假设 model 处理 [Batch_Any, 1, H, W]
-                    x_rec_reshaped = model(y, A, AT)
+                
+                with autocast(enabled=torch.cuda.is_available()):
+                    # 模型重构 (使用我们上一版的 Attentive mHC Model)
+                    x_rec_flat = model(y, A_func, AT_func)
 
-                    # Loss: L1 Loss
-                    loss = F.l1_loss(x_rec_reshaped, x_reshaped)
+                    # 计算损失
+                    loss_img = criterion_img(x_rec_flat, x_flat)
+                    loss_meas = criterion_meas(A_func(x_rec_flat), y)
+                    
+                    loss = loss_img + 1.0 * loss_meas
+                    
+                    # 激活 FFL
+                    loss_freq = torch.tensor(0.0).to(device)
+                    if ffl_weight > 0:
+                        loss_freq = criterion_freq(x_rec_flat, x_flat)
+                        loss += ffl_weight * loss_freq
 
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
 
-                train_loss += loss.item()
-                pbar.set_postfix({'L1': f"{loss.item():.4f}"})
+                loss_avg += loss.item()
+                pbar.set_postfix({
+                    'L_img': f"{loss_img.item():.4f}", 
+                    'L_frq': f"{loss_freq.item():.4f}" if ffl_weight > 0 else "0.00"
+                })
+                
+                global_step = (epoch - 1) * len(train_loader) + step
+                if step % 10 == 0:
+                    writer.add_scalar('Loss/Total', loss.item(), global_step)
+                    writer.add_scalar('Loss/Image', loss_img.item(), global_step)
+                    if ffl_weight > 0:
+                        writer.add_scalar('Loss/Freq', loss_freq.item(), global_step)
 
-            avg_train_loss = train_loss / len(train_loader)
+            except Exception as e:
+                logger.error(f"Error at step {step}: {e}")
+                traceback.print_exc()
+                continue
 
-            # --------------------
-            # 5. 验证循环 (Validation)
-            # --------------------
-            if epoch % 1 == 0:  # 每个 epoch 都验证
-                model.eval()
-                val_psnr = 0.0
-                val_ssim = 0.0
+        scheduler.step()
+        writer.add_scalar('LR/Model', optimizer.param_groups[0]['lr'], epoch)
 
-                with torch.no_grad():
-                    # val_pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]")
-                    for val_x in val_loader:
-                        val_x = val_x.to(device)
-                        b, c, h, w = val_x.shape
-                        val_x_reshaped = val_x.view(b * c, 1, h, w)
+        # 7. Validation Loop
+        if epoch % 1 == 0:
+            model.eval()
+            cs_matrix_module.eval()
+            psnr_acc, ssim_acc = 0.0, 0.0
+            vis_gt, vis_rec = None, None
 
-                        A_val, AT_val = make_A_AT_for_patch(img_size, B, Phi, device)
-                        y_val = A_val(val_x_reshaped)
+            with torch.no_grad():
+                # 验证时使用当前学到的 Phi
+                Phi = cs_matrix_module()
+                
+                for i, x_val in enumerate(val_loader):
+                    x_val = x_val.to(device)
+                    b, c, h, w = x_val.shape
+                    x_flat = x_val.view(b*c, 1, h, w)
+                    
+                    A_func, AT_func = make_A_AT_for_patch(h, args.block_size, Phi)
+                    y = A_func(x_flat)
 
-                        rec_reshaped = model(y_val, A_val, AT_val)
+                    x_rec_flat = model(y, A_func, AT_func)
 
-                        # 还原回 RGB [B, 3, H, W] 用于计算指标
-                        rec_rgb = rec_reshaped.view(b, c, h, w)
-                        val_x_rgb = val_x  # 原始 RGB
+                    x_rec_rgb = x_rec_flat.view(b, c, h, w)
+                    x_rec_rgb = torch.clamp(x_rec_rgb, 0, 1)
 
-                        # 截断到 [0, 1]
-                        rec_rgb = torch.clamp(rec_rgb, 0, 1)
+                    p, s = calculate_metrics(x_rec_rgb, x_val)
+                    psnr_acc += p
+                    ssim_acc += s
+                    
+                    if i == 0:
+                        vis_gt = x_val
+                        vis_rec = x_rec_rgb
 
-                        batch_psnr, batch_ssim = calculate_metrics(rec_rgb, val_x_rgb)
-                        val_psnr += batch_psnr
-                        val_ssim += batch_ssim
+            avg_psnr = psnr_acc / len(val_loader)
+            avg_ssim = ssim_acc / len(val_loader)
+            avg_loss = loss_avg / len(train_loader)
 
-                avg_val_psnr = val_psnr / len(val_loader)
-                avg_val_ssim = val_ssim / len(val_loader)
+            logger.info(f"Ep {epoch} | Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Val SSIM: {avg_ssim:.4f}")
+            
+            writer.add_scalar('Metrics/PSNR', avg_psnr, epoch)
+            writer.add_scalar('Metrics/SSIM', avg_ssim, epoch)
+            
+            save_validation_images(vis_gt, vis_rec, epoch, args.save_dir)
 
-                logger.info(
-                    f"Epoch {epoch} Summary: Train Loss={avg_train_loss:.6f} | Val PSNR={avg_val_psnr:.2f} dB | Val SSIM={avg_val_ssim:.4f}")
-
-                # 保存最佳模型
-                if avg_val_ssim > best_ssim:
-                    best_ssim = avg_val_ssim
-                    save_path = os.path.join(args.save_dir, f"best_model_class{args.target_class}.pth")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_ssim': best_ssim,
-                        'args': vars(args)
-                    }, save_path)
-                    logger.info(f"★ New Best Model Saved! SSIM: {best_ssim:.4f}")
-
-    except Exception as e:
-        logger.error("训练过程中发生严重错误！")
-        logger.error(e, exc_info=True)
-        raise e
-
+            if avg_psnr > best_psnr:
+                best_psnr = avg_psnr
+                # 同时保存模型和采样矩阵
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'matrix_state_dict': cs_matrix_module.state_dict(),
+                }, os.path.join(args.save_dir, f"best_model_cls{args.target_class}.pth"))
+                logger.info(f"==> Best Saved! ({best_psnr:.2f} dB)")
+    
+    writer.close()
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+    except Exception as e:
+        print("\n" + "!"*60)
+        print("CRITICAL ERROR IN TRAINING")
+        print("!"*60)
+        traceback.print_exc()
+        print("!"*60)
