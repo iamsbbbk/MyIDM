@@ -14,28 +14,23 @@ from forward import (
 )
 
 # ==========================================
-# 🛡️ 底层安全设施: 主动防御型算子
+# 检测模块
 # ==========================================
 class SafeConv2d(nn.Conv2d):
-    """
-    带安全断言的 Conv2d。
-    用于在模型[初始化]阶段直接拦截 out_channels=0 的致命错误。
-    """
     def __init__(self, in_channels, out_channels, kernel_size, **kwargs):
         if in_channels <= 0:
-            raise ValueError(f"🚨 [SafeConv2d] 致命错误: in_channels 必须大于0, 但收到 {in_channels}!")
+            raise ValueError(f"[SafeConv2d] 致命错误: in_channels 必须大于0, 但收到 {in_channels}!")
         if out_channels <= 0:
-            raise ValueError(f"🚨 [SafeConv2d] 致命错误: out_channels 必须大于0, 但收到 {out_channels}! (这通常是因为通道数被整除了)")
+            raise ValueError(f"[SafeConv2d] 致命错误: out_channels 必须大于0, 但收到 {out_channels}! (这通常是因为通道数被整除了)")
         super().__init__(in_channels, out_channels, kernel_size, **kwargs)
 
 
 # ==========================================
-# 🌟 创新点 1: 通道注意力 (视神经门控)
+#  通道注意力
 # ==========================================
 class ChannelAttention(nn.Module):
     """
     Squeeze-and-Excitation (SE) 风格的通道注意力。
-    用于在极度压缩的场景下，动态抑制无用噪声通道，增强包含刀具磨损高频特征的通道。
     """
     def __init__(self, channels, reduction=4):
         super().__init__()
@@ -60,7 +55,7 @@ class ChannelAttention(nn.Module):
 
 
 # ==========================================
-# 🌟 创新点 2: 融合注意力的流形混合器 (Attentive mHC)
+# 融合注意力的流形混合器 (Attentive mHC)
 # ==========================================
 class AttentiveManifoldMixer(nn.Module):
     def __init__(self, in_channels):
@@ -86,7 +81,7 @@ class AttentiveManifoldMixer(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         if C != self.channels:
-            raise RuntimeError(f"🚨 [AttentiveManifoldMixer] 期望通道 {self.channels}, 实际 {C}")
+            raise RuntimeError(f"[AttentiveManifoldMixer] 期望通道 {self.channels}, 实际 {C}")
             
         # 步骤 1: 特征过滤 (Attention)
         # 让网络评估当前特征图中，哪些通道包含了真正的缺陷/纹理
@@ -103,7 +98,7 @@ class AttentiveManifoldMixer(nn.Module):
 
 
 # ==========================================
-# IDM 原始组件: Injector (保留原结构，增强鲁棒性)
+# Injector
 # ==========================================
 class Injector(nn.Module):
     def __init__(self, nf, r, T):
@@ -127,12 +122,12 @@ class Injector(nn.Module):
             x = torch.cat([x, AT(A(x)), ATy], dim=1)
             return x_in + self.i2f[t - 1](x)
         except Exception as e:
-            print(f"🚨 [Injector] 运行时维度错误! Input shape: {x_in.shape}")
+            print(f" [Injector] 运行时维度错误! Input shape: {x_in.shape}")
             raise e
 
 
 # ==========================================
-# IDM 核心组件: Step
+# Step组件
 # ==========================================
 class Step(RevModule):
     def __init__(self, t):
@@ -151,7 +146,7 @@ class Step(RevModule):
                 # 1. 噪声估计 (epsilon prediction)
                 e = F.pixel_shuffle(unet(F.pixel_unshuffle(x, 2)), 2)
             except Exception as e_unet:
-                print(f"🚨 [UNet Step Error] Time step {t}, Input shape {x.shape}")
+                print(f"[UNet Step Error] Time step {t}, Input shape {x.shape}")
                 raise e_unet
 
             # 2. 纯净图像估计 (x0 estimation)
@@ -187,7 +182,7 @@ class Net(nn.Module):
         self.body = nn.ModuleList([Step(T - i) for i in range(T)])
 
         # ---------------------------------------------------------
-        # 💡 [核心升级] 使用 AttentiveManifoldMixer
+        # 使用 AttentiveManifoldMixer
         # 处理 RGB 图像级特征时，in_channels=3
         # ---------------------------------------------------------
         self.mixer = nn.ModuleList([AttentiveManifoldMixer(in_channels=3) for _ in range(T)])
@@ -293,7 +288,7 @@ class Net(nn.Module):
             x = RevBackProp.apply(x, self.body)
         except RuntimeError as e:
             print("\n" + "="*50)
-            print("🚨 发生前向传播崩溃！错误上下文诊断:")
+            print("发生前向传播崩溃！错误上下文诊断:")
             print(f"当前输入 y 的形状: {y.shape}")
             print(f"反投影后 x 的初始形状: {ATy.shape}")
             print(f"进入 RevBackProp 前 x 的形状: {x_concat.shape}")
