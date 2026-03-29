@@ -2,8 +2,8 @@ from .config import load_config
 from .dataset import ToolWearDataset, SlidingWindowBuffer
 from .model import SemanticSenderModel, load_sender_checkpoint
 from .protocol import SemanticPacket, packet_to_bytes, bytes_to_packet
-from .runtime import IndustrialSemanticSenderEngine
-from .receiver import IndustrialSemanticReceiverEngine, MyIDMReceiverAdapter
+from .runtime import IndustrialSemanticSenderEngine, MyIDMReceiverAdapter
+from .myidm_receiver import MyIDMReceiver
 
 __all__ = [
     "load_config",
@@ -15,6 +15,6 @@ __all__ = [
     "packet_to_bytes",
     "bytes_to_packet",
     "IndustrialSemanticSenderEngine",
-    "IndustrialSemanticReceiverEngine",
     "MyIDMReceiverAdapter",
+    "MyIDMReceiver",
 ]

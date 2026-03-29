@@ -57,72 +57,27 @@ policy:
   promotion_threshold: 0.55
 
 receiver:
-  # 指向 MyIDM 中真正的接收模型类
-  # 例如：
-  # module: "myidm.models.receiver_model"
-  # class_name: "ReceiverNet"
-  module: ""
-  class_name: ""
+  # 现在默认走我们新增的桥接接收器
+  module: "industrial_semantic.myidm_receiver"
+  class_name: "MyIDMReceiver"
   checkpoint: ""
-  init_kwargs: {}
-
-  # auto / packet / latent / signal
-  accept_mode: "auto"
-
-  # 调用顺序
-  invocation_order:
-    - "packet"
-    - "latent"
-    - "signal"
-    - "callable"
-
-  # packet 形式调用候选方法
-  packet_method_candidates:
+  init_kwargs:
+    device: "cpu"
+    myidm_module: "model"
+    myidm_forward_module: "forward"
+    model_class_name: ""
+    init_kwargs: {}
+    return_raw_when_available: true
+    verbose: false
+  method_candidates:
     - "decode_packet"
-    - "receive_packet"
     - "decode"
-    - "inference"
-
-  # latent 形式调用候选方法
-  latent_method_candidates:
-    - "decode_latent"
-    - "decode"
-    - "reconstruct_from_latent"
-    - "forward"
-    - "inference"
-
-  # signal/raw waveform 调用候选方法
-  signal_method_candidates:
-    - "predict_signal"
     - "reconstruct"
     - "forward"
-    - "predict"
     - "inference"
-
-  # 可选：MyIDM 预处理/后处理 hook
-  preprocess_module: ""
-  preprocess_class_name: ""
-  preprocess_kwargs: {}
-
-  postprocess_module: ""
-  postprocess_class_name: ""
-  postprocess_kwargs: {}
-
-  strict_protocol: false
-  supported_protocols:
-    - "ISC-TWM-1.0"
-
-  strict_normalization: false
-  supported_normalization_ids:
-    - "global-zscore-v1"
-
-  allow_duplicate_window: false
-  replay_cache_size: 4096
-  history_size: 256
-  expected_signal_channels: 3
-
   use_reference_decoder_fallback: true
-  reference_checkpoint: "./checkpoints/industrial_semantic/best.pt"
+  reference_checkpoint: ""
+
 runtime:
   session_id: "SESSION-001"
   machine_id: "M001"

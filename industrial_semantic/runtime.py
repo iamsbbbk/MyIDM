@@ -34,9 +34,9 @@ def symmetric_dequantize_ndarray(q: np.ndarray, scale: Union[float, np.ndarray])
 
 class WearStateManager:
     """
-    时间维度的磨损阶段管理器：
-    - 使用 EMA 平滑 wear 概率
-    - 尽量避免不合理逆跳
+    磨损状态时间平滑器：
+    - EMA 平滑 wear_probs
+    - 尽量避免不合理回跳
     """
 
     def __init__(self, ema_alpha: float = 0.60, promotion_threshold: float = 0.55):
@@ -50,6 +50,7 @@ class WearStateManager:
 
     def update(self, wear_probs: np.ndarray) -> Tuple[int, np.ndarray]:
         wear_probs = np.asarray(wear_probs, dtype=np.float32)
+
         if self.wear_ema is None:
             self.wear_ema = wear_probs.copy()
         else:
@@ -69,7 +70,7 @@ class WearStateManager:
                 self.stage = pred
             return self.stage, self.wear_ema.copy()
 
-        # pred < self.stage，默认不回退，除非证据极强
+        # pred < self.stage 时默认不回退，只有证据很强才回退
         if wear_probs[pred] >= 0.95 and self.wear_ema[self.stage] < 0.25:
             self.stage = pred
 
@@ -79,12 +80,11 @@ class WearStateManager:
 class IndustrialSemanticSenderEngine:
     """
     发送端主引擎：
-    1. 语义识别
-    2. 占空比估计
-    3. 策略决策
-    4. 条件编码
-    5. 协议封包
-    6. idle 段聚合
+    - 语义识别
+    - 占空比估计
+    - 传输模式选择
+    - latent 量化与 packet 封装
+    - idle 段聚合
     """
 
     def __init__(
@@ -129,6 +129,13 @@ class IndustrialSemanticSenderEngine:
         self.window_counter = 0
         self.pending_idle_segment = None
 
+    def reset_sequence_state(self):
+        """
+        在切换文件 / 刀具 / run 时调用，避免状态串台。
+        """
+        self.state_manager.reset()
+        self.pending_idle_segment = None
+
     def _normalize(self, signal: np.ndarray) -> np.ndarray:
         if not self.norm_enabled:
             return signal.astype(np.float32)
@@ -136,7 +143,7 @@ class IndustrialSemanticSenderEngine:
 
     def _estimate_occupancy_ratio(self, signal_raw: np.ndarray) -> Tuple[float, List[int], List[float]]:
         """
-        使用微窗 RMS 粗估切削占空比。
+        基于微窗 RMS 粗估切削占空比，用来辅助 contact 判定。
         """
         splits = int(self.policy_cfg.get("occupancy_splits", 4))
         energy_ratio = float(self.policy_cfg.get("occupancy_energy_ratio", 0.35))
@@ -156,8 +163,8 @@ class IndustrialSemanticSenderEngine:
             rms = np.sqrt(np.mean(seg ** 2) + 1e-12)
             energies.append(float(rms))
 
-        max_e = max(energies) if len(energies) > 0 else 0.0
-        mean_e = float(np.mean(energies)) if len(energies) > 0 else 0.0
+        max_e = max(energies) if energies else 0.0
+        mean_e = float(np.mean(energies)) if energies else 0.0
 
         if max_e < 1e-8:
             mask = [0 for _ in energies]
@@ -165,7 +172,7 @@ class IndustrialSemanticSenderEngine:
 
         thr = max(max_e * energy_ratio, mean_e * 0.95)
         mask = [1 if e >= thr else 0 for e in energies]
-        occ = float(np.mean(mask)) if len(mask) > 0 else 0.0
+        occ = float(np.mean(mask)) if mask else 0.0
 
         return occ, mask, energies
 
@@ -217,7 +224,7 @@ class IndustrialSemanticSenderEngine:
         metadata = metadata or {}
         self.window_counter += 1
 
-        header = {
+        return {
             "protocol_version": "ISC-TWM-1.0",
             "session_id": metadata.get("session_id", self.runtime_cfg.get("session_id", "SESSION-001")),
             "machine_id": metadata.get("machine_id", self.runtime_cfg.get("machine_id", "M001")),
@@ -235,14 +242,8 @@ class IndustrialSemanticSenderEngine:
             "payload_mode": payload_mode,
             "checksum": "",
         }
-        return header
 
-    def _update_idle_segment(
-        self,
-        header: Dict[str, Any],
-        anchors: Dict[str, float],
-        semantic: Dict[str, Any],
-    ):
+    def _update_idle_segment(self, header: Dict[str, Any], anchors: Dict[str, float], semantic: Dict[str, Any]):
         if self.pending_idle_segment is None:
             self.pending_idle_segment = {
                 "start_header": header,
@@ -297,9 +298,7 @@ class IndustrialSemanticSenderEngine:
     def analyze_window(self, signal: np.ndarray, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         signal_raw = ensure_signal_ch_first(signal, expected_channels=3).astype(np.float32)
         if signal_raw.shape[1] != self.window_length:
-            raise ValueError(
-                f"输入窗口长度必须为 {self.window_length}，当前为 {signal_raw.shape[1]}"
-            )
+            raise ValueError(f"输入窗口长度必须为 {self.window_length}，当前为 {signal_raw.shape[1]}")
 
         signal_norm = self._normalize(signal_raw)
         x = torch.from_numpy(signal_norm).unsqueeze(0).float().to(self.device)
@@ -308,7 +307,7 @@ class IndustrialSemanticSenderEngine:
         contact_probs = outputs["contact_probs"][0].detach().cpu().numpy()
         wear_probs = outputs["wear_probs"][0].detach().cpu().numpy()
         mapped_probs = outputs["mapped_probs"][0].detach().cpu().numpy()
-        latent = outputs["latent"][0].detach().cpu().numpy()  # [C, T]
+        latent = outputs["latent"][0].detach().cpu().numpy()
 
         occupancy_ratio, occupancy_mask, occupancy_energies = self._estimate_occupancy_ratio(signal_raw)
         contact_state, contact_label = self._decide_contact_state(contact_probs, occupancy_ratio)
@@ -428,7 +427,7 @@ class IndustrialSemanticSenderEngine:
         analysis = self.analyze_window(signal, metadata=metadata)
         packets = []
 
-        # 如果当前不是 idle，先把之前积累的 idle 段 flush
+        # 遇到非 idle 先 flush 之前累积的 idle segment
         if analysis["semantic"]["contact_state"] != "idle":
             flushed = self._flush_idle_segment(return_bytes=return_bytes)
             if flushed is not None:
@@ -453,11 +452,10 @@ class IndustrialSemanticSenderEngine:
 
 class MyIDMReceiverAdapter:
     """
-    用于和 MyIDM 现有接收端对接的适配层。
-    特点：
-    - 尝试动态导入 MyIDM 接收类
-    - 逐个候选方法尝试调用
-    - 如果失败，则回退到 reference decoder
+    接收端总适配器：
+    1. 优先加载一个统一包装的 MyIDMReceiver
+    2. 若失败，则尝试用户配置的 receiver.module/class_name
+    3. 若仍失败，则 fallback 到 reference decoder / raw passthrough
     """
 
     def __init__(self, config: Dict[str, Any], device: Optional[str] = None):
@@ -484,34 +482,40 @@ class MyIDMReceiverAdapter:
                     self.logger.warning(f"reference decoder 加载失败: {e}")
 
     def _load_receiver_instance(self):
-        module_name = self.receiver_cfg.get("module", "")
-        class_name = self.receiver_cfg.get("class_name", "")
+        # 默认直接用我们新增的桥接类
+        module_name = self.receiver_cfg.get("module", "") or "industrial_semantic.myidm_receiver"
+        class_name = self.receiver_cfg.get("class_name", "") or "MyIDMReceiver"
         checkpoint = self.receiver_cfg.get("checkpoint", "")
-        init_kwargs = self.receiver_cfg.get("init_kwargs", {}) or {}
 
-        if not module_name or not class_name:
-            self.logger.warning("未配置 MyIDM receiver.module / class_name，将只使用 fallback 解码。")
-            return None
+        init_kwargs = dict(self.receiver_cfg.get("init_kwargs", {}) or {})
+        init_kwargs.setdefault("device", self.device)
+        if checkpoint and "checkpoint" not in init_kwargs:
+            init_kwargs["checkpoint"] = checkpoint
 
         try:
             mod = importlib.import_module(module_name)
             cls = getattr(mod, class_name)
             obj = cls(**init_kwargs)
 
-            if checkpoint and hasattr(obj, "load_state_dict"):
-                ckpt = torch.load(checkpoint, map_location=self.device)
-                state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-                obj.load_state_dict(state_dict, strict=False)
-
             if isinstance(obj, torch.nn.Module):
                 obj.to(self.device)
                 obj.eval()
 
-            self.logger.info(f"已加载 MyIDM 接收端: {module_name}.{class_name}")
+            self.logger.info(f"已加载接收端: {module_name}.{class_name}")
             return obj
         except Exception as e:
-            self.logger.warning(f"MyIDM 接收端加载失败: {e}")
+            self.logger.warning(f"接收端加载失败: {e}")
             return None
+
+    def _normalize_receiver_output(self, out, method_name: str):
+        out = recursive_to_numpy(out)
+        if isinstance(out, dict):
+            out.setdefault("used_path", f"myidm:{method_name}")
+            return out
+        return {
+            "used_path": f"myidm:{method_name}",
+            "receiver_output": out,
+        }
 
     def _try_call_receiver(self, packet: SemanticPacket, latent: Optional[np.ndarray], raw_signal: Optional[np.ndarray]):
         if self.receiver is None:
@@ -550,15 +554,12 @@ class MyIDMReceiverAdapter:
         for name, fn, arg in attempts:
             try:
                 out = fn(arg)
-                return {
-                    "used_path": f"myidm:{name}",
-                    "receiver_output": recursive_to_numpy(out),
-                }
+                return self._normalize_receiver_output(out, name)
             except Exception as e:
                 last_err = e
 
         if last_err is not None:
-            self.logger.warning(f"MyIDM receiver 调用失败，最后一次错误: {last_err}")
+            self.logger.warning(f"receiver 调用失败，最后一次错误: {last_err}")
         return None
 
     def receive(self, packet_or_bytes: Union[SemanticPacket, bytes]) -> Dict[str, Any]:
@@ -593,18 +594,18 @@ class MyIDMReceiverAdapter:
         latent = None
         if "latent_q" in payload and "latent_scale" in payload:
             latent = symmetric_dequantize_ndarray(payload["latent_q"], payload["latent_scale"])
+        elif "latent" in payload:
+            latent = np.asarray(payload["latent"], dtype=np.float32)
 
-        # 优先尝试 MyIDM 真正接收端
+        # 1) 优先尝试 MyIDM 接收端
         myidm_result = self._try_call_receiver(packet, latent=latent, raw_signal=raw_signal)
         if myidm_result is not None:
-            myidm_result.update({
-                "packet_mode": mode,
-                "semantic": semantic,
-                "anchors": anchors,
-            })
+            myidm_result.setdefault("packet_mode", mode)
+            myidm_result.setdefault("semantic", semantic)
+            myidm_result.setdefault("anchors", anchors)
             return myidm_result
 
-        # 回退：reference decoder
+        # 2) fallback: reference decoder
         if latent is not None and self.reference_sender is not None:
             try:
                 latent_tensor = torch.from_numpy(latent).unsqueeze(0).float().to(self.device)
@@ -620,7 +621,7 @@ class MyIDMReceiverAdapter:
             except Exception as e:
                 self.logger.warning(f"reference decoder 解码失败: {e}")
 
-        # 再回退：如果 payload 带 raw_signal，直接透传
+        # 3) fallback: raw passthrough
         if raw_signal is not None:
             return {
                 "used_path": "raw_passthrough",
@@ -630,6 +631,7 @@ class MyIDMReceiverAdapter:
                 "reconstructed_signal": np.asarray(raw_signal, dtype=np.float32),
             }
 
+        # 4) 最后只保留语义
         return {
             "used_path": "semantic_only",
             "packet_mode": mode,
