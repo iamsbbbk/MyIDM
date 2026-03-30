@@ -57,7 +57,6 @@ policy:
   promotion_threshold: 0.55
 
 receiver:
-  # 现在默认走我们新增的桥接接收器
   module: "industrial_semantic.myidm_receiver"
   class_name: "MyIDMReceiver"
   checkpoint: ""
