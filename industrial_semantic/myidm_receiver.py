@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# 确保从 scripts/ 直接执行时，也能找到项目根目录下的 model.py / forward.py
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -95,17 +94,6 @@ def _extract_signal_from_any(obj: Any) -> Optional[np.ndarray]:
 
 
 class MyIDMReceiver:
-    """
-    一个“桥接式”接收端包装器：
-    - 尽量少改 MyIDM 原代码
-    - 自动尝试加载根目录 model.py / forward.py
-    - 自动尝试类、构造函数、forward/inference/decode 等接口
-    - 解包 packet 后，尽量调用 MyIDM
-    - 如果 MyIDM 不适配，则至少保证 raw_signal / semantic fallback 可用
-
-    这是一层“安全适配器”，不是强侵入式重写。
-    """
-
     def __init__(
         self,
         device: str = "cpu",
