@@ -44,13 +44,6 @@ def _safe_float(v, default=0.0):
 
 
 def _ensure_ch_first(signal: np.ndarray, expected_channels: int = 3) -> np.ndarray:
-    """
-    将输入信号统一整理为 [C, T] 形式。
-    允许输入:
-    - [C, T]
-    - [T, C]
-    - [T*3] 一维情况
-    """
     signal = np.asarray(signal, dtype=np.float32)
 
     if signal.ndim == 1:
@@ -77,11 +70,6 @@ def _ensure_ch_first(signal: np.ndarray, expected_channels: int = 3) -> np.ndarr
 
 
 def _try_parse_from_dict(obj: Dict[str, Any], signal_key: str = "signal") -> np.ndarray:
-    """
-    尝试从 dict 中提取信号。
-    支持常见键名:
-    signal / data / x / vibration / xyz / waveform
-    """
     candidate_keys = [
         signal_key,
         "signal",
@@ -113,12 +101,10 @@ def _try_parse_from_dict(obj: Dict[str, Any], signal_key: str = "signal") -> np.
 
 def _load_from_npy(path: Path, signal_key: str = "signal") -> np.ndarray:
     obj = np.load(path, allow_pickle=True)
-
-    # 普通 ndarray
     if isinstance(obj, np.ndarray) and obj.dtype != object:
         return _ensure_ch_first(obj)
 
-    # object ndarray，通常是一个 dict
+    # object ndarray
     if isinstance(obj, np.ndarray) and obj.dtype == object:
         try:
             item = obj.item()
@@ -127,7 +113,6 @@ def _load_from_npy(path: Path, signal_key: str = "signal") -> np.ndarray:
         except Exception:
             pass
 
-        # 万一是 object 数组中嵌套 ndarray
         for v in obj.reshape(-1):
             if isinstance(v, np.ndarray) and v.ndim in [1, 2]:
                 return _ensure_ch_first(v)
@@ -170,11 +155,6 @@ def _load_from_pt(path: Path, signal_key: str = "signal") -> np.ndarray:
 
 
 def _load_from_text(path: Path) -> np.ndarray:
-    """
-    支持 csv / txt:
-    - [T, 3]
-    - [3, T]
-    """
     try:
         arr = np.loadtxt(path, delimiter=",", dtype=np.float32)
     except Exception:
@@ -205,15 +185,6 @@ def _load_from_mat(path: Path, signal_key: str = "signal") -> np.ndarray:
 
 
 def _load_signal(path: Path, signal_key: str = "signal") -> np.ndarray:
-    """
-    读取原始信号，并统一返回 [C, T] float32
-    支持：
-    - .npy
-    - .npz
-    - .pt / .pth
-    - .csv / .txt
-    - .mat (可选，需要 scipy)
-    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"信号文件不存在: {path}")
@@ -244,14 +215,6 @@ def _slice_signal(
     end_idx: Optional[int] = None,
     window_length: Optional[int] = None,
 ) -> np.ndarray:
-    """
-    从长时序信号中切取窗口。
-    规则：
-    - 若 start/end 都给出，则直接切片
-    - 若只给 start + window_length，则 end = start + window_length
-    - 若只给 end + window_length，则 start = end - window_length
-    - 若都不给，则返回原信号
-    """
     signal = _ensure_ch_first(signal)
     total_len = signal.shape[1]
 
@@ -481,7 +444,6 @@ class ToolWearDataset(Dataset):
         path = self._resolve_path(row["path"])
         signal = _load_signal(path, signal_key=self.signal_key).astype(np.float32)
 
-        # 支持从长时序文件中根据索引切片
         has_start = "start_idx" in row and row["start_idx"] != ""
         has_end = "end_idx" in row and row["end_idx"] != ""
 
@@ -542,16 +504,6 @@ class ToolWearDataset(Dataset):
 
 
 class SlidingWindowBuffer:
-    """
-    实时流滑窗缓冲器
-
-    用法示例:
-        buf = SlidingWindowBuffer(window_size=1024, hop_size=1024, channels=3)
-        windows = buf.push(chunk)  # chunk shape: [C, T] or [T, C]
-
-    返回:
-        List[np.ndarray], 每个窗口 shape = [C, window_size]
-    """
 
     def __init__(self, window_size: int = 1024, hop_size: int = 1024, channels: int = 3):
         self.window_size = int(window_size)
@@ -584,11 +536,6 @@ class SlidingWindowBuffer:
         return windows
 
     def flush_tail(self, pad: bool = False) -> List[np.ndarray]:
-        """
-        将缓冲区剩余内容输出：
-        - pad=False: 不输出不足 window_size 的尾部
-        - pad=True: 右侧补零输出一个尾窗口
-        """
         if self.buffer.shape[1] == 0:
             return []
 
@@ -599,7 +546,6 @@ class SlidingWindowBuffer:
             self.buffer = np.zeros((self.channels, 0), dtype=np.float32)
             return [win]
 
-        # 理论上不会到这里，因为 >=window_size 的内容应该已被 push 取出
         win = self.buffer[:, :self.window_size].copy()
         self.buffer = self.buffer[:, self.hop_size:]
         return [win]
