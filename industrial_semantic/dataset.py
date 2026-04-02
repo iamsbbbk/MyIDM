@@ -17,7 +17,11 @@ __all__ = [
     "_safe_int",
     "_safe_float",
     "_ensure_ch_first",
+    "_ensure_image_ch_first",
     "_load_signal",
+    "_load_any_array",
+    "_infer_loaded_modality",
+    "_split_loaded_samples",
     "_slice_signal",
     "_pad_or_trim_signal",
     "ToolWearDataset",
@@ -44,6 +48,13 @@ def _safe_float(v, default=0.0):
 
 
 def _ensure_ch_first(signal: np.ndarray, expected_channels: int = 3) -> np.ndarray:
+    """
+    将单个时序信号整理为 [C, T]
+    支持:
+    - [C, T]
+    - [T, C]
+    - [T*C] 1D
+    """
     signal = np.asarray(signal, dtype=np.float32)
 
     if signal.ndim == 1:
@@ -54,159 +65,316 @@ def _ensure_ch_first(signal: np.ndarray, expected_channels: int = 3) -> np.ndarr
         signal = signal.reshape(expected_channels, -1)
 
     if signal.ndim != 2:
-        raise ValueError(f"信号必须为 2D，当前 shape={signal.shape}")
+        raise ValueError(f"_ensure_ch_first 只支持 2D 时序信号，当前 shape={signal.shape}")
 
-    # 已经是 [C, T]
     if signal.shape[0] == expected_channels:
         return signal.astype(np.float32)
 
-    # [T, C] -> [C, T]
     if signal.shape[1] == expected_channels:
         return signal.T.astype(np.float32)
 
     raise ValueError(
-        f"无法判断通道维度，期望某一维等于 {expected_channels}，当前 shape={signal.shape}"
+        f"无法判断时序信号通道维度，期望某一维等于 {expected_channels}，当前 shape={signal.shape}"
     )
 
 
-def _try_parse_from_dict(obj: Dict[str, Any], signal_key: str = "signal") -> np.ndarray:
-    candidate_keys = [
-        signal_key,
-        "signal",
-        "data",
-        "x",
-        "vibration",
-        "xyz",
-        "waveform",
-        "sensor",
+def _ensure_image_ch_first(image: np.ndarray, expected_channels: int = 3, allow_gray_to_rgb: bool = True) -> np.ndarray:
+    """
+    将单张图像整理为 [C, H, W]
+    支持:
+    - [C, H, W]
+    - [H, W, C]
+    - [H, W]      -> 若 allow_gray_to_rgb=True 则扩为 3 通道
+    """
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        image = image[None, :, :]
+
+    if image.ndim != 3:
+        raise ValueError(f"_ensure_image_ch_first 只支持 2D/3D 图像，当前 shape={image.shape}")
+
+    # CHW
+    if image.shape[0] in [1, expected_channels] and image.shape[1] >= 4 and image.shape[2] >= 4:
+        out = image
+    # HWC
+    elif image.shape[-1] in [1, expected_channels] and image.shape[0] >= 4 and image.shape[1] >= 4:
+        out = np.transpose(image, (2, 0, 1))
+    else:
+        raise ValueError(f"无法判断图像通道维度，当前 shape={image.shape}")
+
+    if out.shape[0] == 1 and expected_channels == 3 and allow_gray_to_rgb:
+        out = np.repeat(out, 3, axis=0)
+
+    return out.astype(np.float32)
+
+
+def _extract_array_from_dict(obj: Dict[str, Any], preferred_keys: Optional[List[str]] = None):
+    preferred_keys = preferred_keys or [
+        "signal", "data", "x", "vibration", "xyz", "waveform",
+        "image", "images", "rgb", "arr", "array"
     ]
 
-    for k in candidate_keys:
+    for k in preferred_keys:
         if k in obj:
-            val = obj[k]
-            if torch.is_tensor(val):
-                val = val.detach().cpu().numpy()
-            if isinstance(val, np.ndarray):
-                return _ensure_ch_first(val)
+            v = obj[k]
+            if torch.is_tensor(v):
+                v = v.detach().cpu().numpy()
+            if isinstance(v, np.ndarray):
+                return v
 
-    # 如果 dict 中没有显式 signal key，则找第一个 1D/2D ndarray
     for _, v in obj.items():
         if torch.is_tensor(v):
             v = v.detach().cpu().numpy()
-        if isinstance(v, np.ndarray) and v.ndim in [1, 2]:
-            return _ensure_ch_first(v)
+        if isinstance(v, np.ndarray):
+            return v
 
-    raise ValueError("无法从 dict 中解析出有效信号")
+    raise ValueError("无法从 dict 中提取 ndarray")
 
 
-def _load_from_npy(path: Path, signal_key: str = "signal") -> np.ndarray:
+def _load_any_array_from_npy(path: Path) -> np.ndarray:
     obj = np.load(path, allow_pickle=True)
-    if isinstance(obj, np.ndarray) and obj.dtype != object:
-        return _ensure_ch_first(obj)
 
-    # object ndarray
+    if isinstance(obj, np.ndarray) and obj.dtype != object:
+        return np.asarray(obj)
+
     if isinstance(obj, np.ndarray) and obj.dtype == object:
+        # 常见：object ndarray 里包了 dict
         try:
             item = obj.item()
             if isinstance(item, dict):
-                return _try_parse_from_dict(item, signal_key=signal_key)
+                return np.asarray(_extract_array_from_dict(item))
         except Exception:
             pass
 
+        # 再尝试枚举其中元素
         for v in obj.reshape(-1):
-            if isinstance(v, np.ndarray) and v.ndim in [1, 2]:
-                return _ensure_ch_first(v)
+            if isinstance(v, np.ndarray):
+                return np.asarray(v)
 
-    raise ValueError(f"无法从 npy 文件中解析有效信号: {path}")
+    raise ValueError(f"无法从 npy 文件解析有效数组: {path}")
 
 
-def _load_from_npz(path: Path, signal_key: str = "signal") -> np.ndarray:
+def _load_any_array_from_npz(path: Path) -> np.ndarray:
     data = np.load(path, allow_pickle=True)
 
-    if signal_key in data:
-        return _ensure_ch_first(data[signal_key])
-
-    candidate_keys = ["signal", "data", "x", "vibration", "xyz", "waveform"]
+    candidate_keys = [
+        "signal", "data", "x", "vibration", "xyz", "waveform",
+        "image", "images", "rgb", "arr", "array"
+    ]
     for k in candidate_keys:
         if k in data:
-            return _ensure_ch_first(data[k])
+            return np.asarray(data[k])
 
     for k in data.files:
         arr = data[k]
-        if isinstance(arr, np.ndarray) and arr.ndim in [1, 2]:
-            return _ensure_ch_first(arr)
+        if isinstance(arr, np.ndarray):
+            return np.asarray(arr)
 
-    raise ValueError(f"无法从 npz 文件中解析有效信号: {path}")
+    raise ValueError(f"无法从 npz 文件解析有效数组: {path}")
 
 
-def _load_from_pt(path: Path, signal_key: str = "signal") -> np.ndarray:
+def _load_any_array_from_pt(path: Path) -> np.ndarray:
     obj = torch.load(path, map_location="cpu")
 
     if torch.is_tensor(obj):
-        return _ensure_ch_first(obj.detach().cpu().numpy())
+        return obj.detach().cpu().numpy()
 
     if isinstance(obj, dict):
-        return _try_parse_from_dict(obj, signal_key=signal_key)
+        return np.asarray(_extract_array_from_dict(obj))
 
     if isinstance(obj, np.ndarray):
-        return _ensure_ch_first(obj)
+        return np.asarray(obj)
 
-    raise ValueError(f"无法从 pt/pth 文件中解析有效信号: {path}")
+    raise ValueError(f"无法从 pt/pth 文件解析有效数组: {path}")
 
 
-def _load_from_text(path: Path) -> np.ndarray:
+def _load_any_array_from_text(path: Path) -> np.ndarray:
     try:
-        arr = np.loadtxt(path, delimiter=",", dtype=np.float32)
+        arr = np.loadtxt(path, delimiter=",")
     except Exception:
-        arr = np.loadtxt(path, dtype=np.float32)
-    return _ensure_ch_first(arr)
+        arr = np.loadtxt(path)
+    return np.asarray(arr)
 
 
-def _load_from_mat(path: Path, signal_key: str = "signal") -> np.ndarray:
+def _load_any_array_from_mat(path: Path) -> np.ndarray:
     if not _HAS_SCIPY:
         raise ImportError("当前环境未安装 scipy，无法读取 .mat 文件")
 
     obj = sio.loadmat(path)
-    candidate_keys = [signal_key, "signal", "data", "x", "vibration", "xyz", "waveform"]
+    candidate_keys = [
+        "signal", "data", "x", "vibration", "xyz", "waveform",
+        "image", "images", "rgb", "arr", "array"
+    ]
 
     for k in candidate_keys:
-        if k in obj:
-            arr = obj[k]
-            if isinstance(arr, np.ndarray) and arr.ndim in [1, 2]:
-                return _ensure_ch_first(arr)
+        if k in obj and isinstance(obj[k], np.ndarray):
+            return np.asarray(obj[k])
 
     for k, v in obj.items():
         if k.startswith("__"):
             continue
-        if isinstance(v, np.ndarray) and v.ndim in [1, 2]:
-            return _ensure_ch_first(v)
+        if isinstance(v, np.ndarray):
+            return np.asarray(v)
 
-    raise ValueError(f"无法从 mat 文件中解析有效信号: {path}")
+    raise ValueError(f"无法从 mat 文件解析有效数组: {path}")
 
 
-def _load_signal(path: Path, signal_key: str = "signal") -> np.ndarray:
+def _load_any_array(path: Path) -> np.ndarray:
+    """
+    通用数组加载器：
+    不强行假设它是 [C,T]，而是原样读出 ndarray
+    """
     path = Path(path)
     if not path.exists():
-        raise FileNotFoundError(f"信号文件不存在: {path}")
+        raise FileNotFoundError(f"文件不存在: {path}")
 
     suffix = path.suffix.lower()
 
     if suffix == ".npy":
-        return _load_from_npy(path, signal_key=signal_key)
+        return _load_any_array_from_npy(path)
 
     if suffix == ".npz":
-        return _load_from_npz(path, signal_key=signal_key)
+        return _load_any_array_from_npz(path)
 
     if suffix in [".pt", ".pth"]:
-        return _load_from_pt(path, signal_key=signal_key)
+        return _load_any_array_from_pt(path)
 
     if suffix in [".csv", ".txt"]:
-        return _load_from_text(path)
+        return _load_any_array_from_text(path)
 
     if suffix == ".mat":
-        return _load_from_mat(path, signal_key=signal_key)
+        return _load_any_array_from_mat(path)
 
-    raise ValueError(f"暂不支持的数据格式: {suffix}, path={path}")
+    raise ValueError(f"暂不支持的文件格式: {suffix}, path={path}")
+
+
+def _infer_loaded_modality(arr: np.ndarray) -> str:
+    """
+    粗略判断加载出来的数据是：
+    - signal_single
+    - signal_batch
+    - image_single
+    - image_batch
+    - label_vector
+    - unsupported
+    """
+    arr = np.asarray(arr)
+
+    if arr.ndim == 0:
+        return "unsupported"
+
+    if arr.ndim == 1:
+        return "label_vector"
+
+    if arr.ndim == 2:
+        # [C,T] or [T,C]
+        if 3 in arr.shape:
+            return "signal_single"
+        # 灰度图 [H,W]
+        if arr.shape[0] >= 8 and arr.shape[1] >= 8:
+            return "image_single"
+        return "unsupported"
+
+    if arr.ndim == 3:
+        # 单张图像 [C,H,W] or [H,W,C]
+        if ((arr.shape[0] in [1, 3]) and arr.shape[1] >= 8 and arr.shape[2] >= 8) or \
+           ((arr.shape[-1] in [1, 3]) and arr.shape[0] >= 8 and arr.shape[1] >= 8):
+            return "image_single"
+
+        # 批量时序 [N,C,T] or [N,T,C]
+        if arr.shape[1] in [1, 3] and arr.shape[2] >= 16:
+            return "signal_batch"
+        if arr.shape[2] in [1, 3] and arr.shape[1] >= 16:
+            return "signal_batch"
+
+        return "unsupported"
+
+    if arr.ndim == 4:
+        # 批量图像 [N,C,H,W] or [N,H,W,C]
+        if arr.shape[1] in [1, 3] and arr.shape[2] >= 8 and arr.shape[3] >= 8:
+            return "image_batch"
+        if arr.shape[-1] in [1, 3] and arr.shape[1] >= 8 and arr.shape[2] >= 8:
+            return "image_batch"
+
+        return "unsupported"
+
+    return "unsupported"
+
+
+def _split_loaded_samples(arr: np.ndarray, max_samples: Optional[int] = None) -> Dict[str, Any]:
+    """
+    将一个文件中加载出的 ndarray 拆成若干样本。
+
+    返回:
+    {
+        "kind": "...",
+        "modality": "signal1d" / "image2d" / None,
+        "samples": [np.ndarray, ...]
+    }
+    """
+    arr = np.asarray(arr)
+    kind = _infer_loaded_modality(arr)
+
+    samples = []
+    modality = None
+
+    if kind == "signal_single":
+        samples = [_ensure_ch_first(arr)]
+        modality = "signal1d"
+
+    elif kind == "signal_batch":
+        n = arr.shape[0]
+        if max_samples is not None:
+            n = min(n, int(max_samples))
+        for i in range(n):
+            samples.append(_ensure_ch_first(arr[i]))
+        modality = "signal1d"
+
+    elif kind == "image_single":
+        samples = [_ensure_image_ch_first(arr)]
+        modality = "image2d"
+
+    elif kind == "image_batch":
+        n = arr.shape[0]
+        if max_samples is not None:
+            n = min(n, int(max_samples))
+        for i in range(n):
+            samples.append(_ensure_image_ch_first(arr[i]))
+        modality = "image2d"
+
+    return {
+        "kind": kind,
+        "modality": modality,
+        "samples": samples,
+    }
+
+
+def _load_signal(path: Path, signal_key: str = "signal") -> np.ndarray:
+    """
+    兼容旧代码的“单个时序信号”加载器。
+    如果文件实际是图像 batch，会给出更清晰的报错。
+    """
+    arr = _load_any_array(path)
+    kind = _infer_loaded_modality(arr)
+
+    if kind == "signal_single":
+        return _ensure_ch_first(arr)
+
+    if kind == "signal_batch":
+        raise ValueError(
+            f"_load_signal 只适用于单个时序样本，但当前文件更像批量时序数据，shape={arr.shape}。"
+            f"请改用 _load_any_array + _split_loaded_samples。"
+        )
+
+    if kind in ["image_single", "image_batch"]:
+        raise ValueError(
+            f"_load_signal 只适用于单个 [C,T] 时序信号，但当前文件更像图像数据，shape={arr.shape}。"
+            f"例如你的 ToolWear_RGB 数据通常是 [N,3,32,32]。"
+            f"请改用 _load_any_array + _split_loaded_samples。"
+        )
+
+    raise ValueError(f"无法将文件解析为单个时序信号，shape={arr.shape}")
 
 
 def _slice_signal(
@@ -250,11 +418,6 @@ def _pad_or_trim_signal(
     target_length: Optional[int] = None,
     pad_mode: str = "constant",
 ) -> np.ndarray:
-    """
-    将信号对齐到 target_length:
-    - 长于 target_length -> 截断
-    - 短于 target_length -> 右侧补零
-    """
     signal = _ensure_ch_first(signal)
     if target_length is None:
         return signal.astype(np.float32)
@@ -282,35 +445,12 @@ def _pad_or_trim_signal(
 
 class ToolWearDataset(Dataset):
     """
-    工业刀具磨损数据集加载器
+    当前这个 Dataset 仍然主要服务于论文方案中的时序振动数据：
+    - path 指向单窗信号文件，或长时序 + start/end 索引
+    - 输出 [C,T]
 
-    支持两种样本组织方式：
-
-    方式 A：每个样本文件本身就是一个 1024 窗口
-    CSV:
-        path,mapped_class,contact_label,wear_label,tool_id,run_id,window_id,...
-
-    方式 B：path 指向整段长时序，CSV 中额外给出 start_idx/end_idx
-    CSV:
-        path,start_idx,end_idx,mapped_class,contact_label,wear_label,...
-
-    标签定义：
-    - mapped_class:
-        0 = idle
-        1 = initial
-        2 = steady
-        3 = accelerating
-
-    - contact_label:
-        0 = idle
-        1 = mixed
-        2 = cutting
-
-    - wear_label:
-        -1 = NA（idle）
-         0 = initial
-         1 = steady
-         2 = accelerating
+    对于 ToolWear_RGB 这种 [N,3,32,32] 的 batched image 文件，
+    推荐走 run_semantic_demo.py 中的通用数组加载流程，而不是这个类。
     """
 
     def __init__(
@@ -424,13 +564,11 @@ class ToolWearDataset(Dataset):
     def _parse_labels(self, row: Dict[str, Any]) -> Tuple[int, int, int]:
         mapped_class = _safe_int(row.get("mapped_class", row.get("label", 0)), default=0)
 
-        # contact_label 默认根据 mapped_class 推断
         if "contact_label" in row and row["contact_label"] != "":
             contact_label = _safe_int(row["contact_label"], default=0)
         else:
             contact_label = 0 if mapped_class == 0 else 2
 
-        # wear_label 默认根据 mapped_class 推断
         if "wear_label" in row and row["wear_label"] != "":
             wear_label = _safe_int(row["wear_label"], default=-1)
         else:
@@ -458,7 +596,6 @@ class ToolWearDataset(Dataset):
                 window_length=self.window_length,
             )
 
-        # 最后统一 pad / trim 到目标长度
         signal = _pad_or_trim_signal(
             signal,
             target_length=self.window_length,
@@ -504,6 +641,11 @@ class ToolWearDataset(Dataset):
 
 
 class SlidingWindowBuffer:
+    """
+    实时流滑窗缓冲器
+    输入 chunk shape: [C,T] 或 [T,C]
+    输出 windows: List[[C, window_size]]
+    """
 
     def __init__(self, window_size: int = 1024, hop_size: int = 1024, channels: int = 3):
         self.window_size = int(window_size)

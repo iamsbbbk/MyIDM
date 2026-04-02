@@ -87,6 +87,8 @@ class MLPHead(nn.Module):
 
 class SignalDecoder(nn.Module):
     """
+    参考解码器：
+    不是强绑定 MyIDM，而是作为训练和 fallback 的参考重构器。
     输入 latent: [B, latent_channels, latent_tokens]
     输出 signal: [B, in_channels, target_length]
     """
@@ -142,7 +144,7 @@ class SemanticSenderModel(nn.Module):
     发送端语义模型：
     - contact head: idle / mixed / cutting
     - wear head: initial / steady / accelerating
-    - mapped head: 0/1/2/3
+    - mapped head: 0/1/2/3 兼容论文标签
     - latent encoder + reference decoder
     """
 
@@ -202,6 +204,7 @@ class SemanticSenderModel(nn.Module):
     @staticmethod
     def hierarchical_mapped_probs(contact_probs: torch.Tensor, wear_probs: torch.Tensor) -> torch.Tensor:
         """
+        由层级语义构造兼容论文的 4 类概率:
         class 0 = idle
         class 1/2/3 = non-idle * wear(initial/steady/accelerating)
         """

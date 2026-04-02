@@ -34,7 +34,9 @@ def symmetric_dequantize_ndarray(q: np.ndarray, scale: Union[float, np.ndarray])
 
 class WearStateManager:
     """
-    磨损状态时间平滑器
+    磨损状态时间平滑器：
+    - EMA 平滑 wear_probs
+    - 尽量避免不合理回跳
     """
 
     def __init__(self, ema_alpha: float = 0.60, promotion_threshold: float = 0.55):
@@ -68,6 +70,7 @@ class WearStateManager:
                 self.stage = pred
             return self.stage, self.wear_ema.copy()
 
+        # pred < self.stage 时默认不回退，只有证据很强才回退
         if wear_probs[pred] >= 0.95 and self.wear_ema[self.stage] < 0.25:
             self.stage = pred
 
@@ -76,7 +79,7 @@ class WearStateManager:
 
 class IndustrialSemanticSenderEngine:
     """
-    发送端：
+    发送端主引擎：
     - 语义识别
     - 占空比估计
     - 传输模式选择
@@ -448,6 +451,12 @@ class IndustrialSemanticSenderEngine:
 
 
 class MyIDMReceiverAdapter:
+    """
+    接收端总适配器：
+    1. 优先加载一个统一包装的 MyIDMReceiver
+    2. 若失败，则尝试用户配置的 receiver.module/class_name
+    3. 若仍失败，则 fallback 到 reference decoder / raw passthrough
+    """
 
     def __init__(self, config: Dict[str, Any], device: Optional[str] = None):
         self.cfg = config

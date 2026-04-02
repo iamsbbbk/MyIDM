@@ -219,11 +219,14 @@ class ReceiverSessionTracker:
 
 class MyIDMModelBridge:
     """
+    动态桥接 MyIDM 原有接收模型。
     支持 4 类输入调用路径：
     1. packet 级
     2. latent 级
     3. signal/raw_signal 级
     4. callable 自动尝试
+
+    这样就不需要大改 MyIDM 原模型。
     """
 
     def __init__(self, receiver_cfg: Dict[str, Any], device: Optional[str] = None):
@@ -647,6 +650,7 @@ class MyIDMModelBridge:
 
 class IndustrialSemanticReceiverEngine:
     """
+    工业语义通信接收引擎。
     负责：
     1. packet 校验
     2. 去重
