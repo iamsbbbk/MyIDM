@@ -351,6 +351,13 @@ def train():
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'matrix_state_dict': cs_matrix_module.state_dict(),
+                    'config': {
+                        'step_number': args.step_number,
+                        'block_size': args.block_size,
+                        'cs_ratio': args.cs_ratio,
+                        'target_class': args.target_class,
+                        'sd_path': args.sd_path,
+                    }
                 }, os.path.join(args.save_dir, f"best_model_cls{args.target_class}.pth"))
                 logger.info(f"==> Best Saved! ({best_psnr:.2f} dB)")
     
