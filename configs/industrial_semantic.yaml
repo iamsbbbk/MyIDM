@@ -1,0 +1,131 @@
+seed: 42
+
+dataset:
+  root_dir: "./data/toolwear"
+  train_index: "./data/toolwear/train.csv"
+  valid_index: "./data/toolwear/valid.csv"
+  test_index: "./data/toolwear/test.csv"
+  sampling_rate: 10240
+  window_length: 1024
+  normalization:
+    enabled: true
+    id: "global-zscore-v1"
+    mean: [0.0, 0.0, 0.0]
+    std: [1.0, 1.0, 1.0]
+
+model:
+  in_channels: 3
+  base_channels: 64
+  attn_heads: 4
+  dropout: 0.1
+  latent_channels: 48
+  latent_tokens: 8
+  use_reference_decoder: true
+  target_length: 1024
+
+train:
+  batch_size: 64
+  num_workers: 4
+  epochs: 50
+  lr: 0.0003
+  weight_decay: 0.0001
+  use_quantization: true
+  quant_bits: 8
+  save_dir: "./checkpoints/industrial_semantic"
+  loss_weights:
+    contact: 1.0
+    wear: 1.0
+    mapped: 1.0
+    reconstruction: 0.3
+
+policy:
+  idle_conf_threshold: 0.90
+  idle_occupancy_threshold: 0.20
+  cutting_occupancy_threshold: 0.80
+  acceleration_alarm_threshold: 0.75
+  uncertainty_threshold: 0.55
+  ood_threshold: 0.60
+  normal_bits: 8
+  mixed_bits: 10
+  alarm_bits: 12
+  occupancy_splits: 4
+  occupancy_energy_ratio: 0.35
+  allow_anchor_only_for_steady: false
+  anchor_only_conf_threshold: 0.98
+  send_raw_on_alarm: true
+  ema_alpha: 0.60
+  promotion_threshold: 0.55
+
+receiver:
+  # 指向 MyIDM 中真正的接收模型类
+  # 例如：
+  # module: "myidm.models.receiver_model"
+  # class_name: "ReceiverNet"
+  module: ""
+  class_name: ""
+  checkpoint: ""
+  init_kwargs: {}
+
+  # auto / packet / latent / signal
+  accept_mode: "auto"
+
+  # 调用顺序
+  invocation_order:
+    - "packet"
+    - "latent"
+    - "signal"
+    - "callable"
+
+  # packet 形式调用候选方法
+  packet_method_candidates:
+    - "decode_packet"
+    - "receive_packet"
+    - "decode"
+    - "inference"
+
+  # latent 形式调用候选方法
+  latent_method_candidates:
+    - "decode_latent"
+    - "decode"
+    - "reconstruct_from_latent"
+    - "forward"
+    - "inference"
+
+  # signal/raw waveform 调用候选方法
+  signal_method_candidates:
+    - "predict_signal"
+    - "reconstruct"
+    - "forward"
+    - "predict"
+    - "inference"
+
+  # 可选：MyIDM 预处理/后处理 hook
+  preprocess_module: ""
+  preprocess_class_name: ""
+  preprocess_kwargs: {}
+
+  postprocess_module: ""
+  postprocess_class_name: ""
+  postprocess_kwargs: {}
+
+  strict_protocol: false
+  supported_protocols:
+    - "ISC-TWM-1.0"
+
+  strict_normalization: false
+  supported_normalization_ids:
+    - "global-zscore-v1"
+
+  allow_duplicate_window: false
+  replay_cache_size: 4096
+  history_size: 256
+  expected_signal_channels: 3
+
+  use_reference_decoder_fallback: true
+  reference_checkpoint: "./checkpoints/industrial_semantic/best.pt"
+runtime:
+  session_id: "SESSION-001"
+  machine_id: "M001"
+  spindle_id: "S001"
+  tool_id: "T001"
+  encoder_version: "semtx-1.0"
